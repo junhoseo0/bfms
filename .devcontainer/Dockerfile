@@ -1,13 +1,16 @@
 FROM ubuntu:noble
 
 USER root
-ARG DEBIAN_FRONTEND=noninteractive
-RUN apt update \
-    && apt install -y --no-install-recommends sudo git zsh curl wget ca-certificates \
-    && apt clean \
-    && apt autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
 
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+        git zsh curl wget ca-certificates \
+    && apt-get clean \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+RUN yes | unminimize
 
 ARG HOME=/root
 ARG ZSH=${HOME}/.oh-my-zsh
