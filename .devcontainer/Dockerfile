@@ -3,10 +3,11 @@ FROM ubuntu:noble
 USER root
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG TZ=Etc/UTC
 RUN apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
-        git zsh curl wget ca-certificates \
+        git zsh curl wget vim ca-certificates \
     && apt-get clean \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
