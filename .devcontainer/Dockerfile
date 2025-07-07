@@ -37,3 +37,10 @@ RUN <<EOT
     echo 'eval "$(uv generate-shell-completion zsh)"' >> ~/.zshrc
     echo 'eval "$(uvx --generate-shell-completion zsh)"' >> ~/.zshrc
 EOT
+
+# Install Bazel for DeepMind Control Suite.
+RUN <<EOT
+    wget -q https://github.com/bazelbuild/bazelisk/releases/download/v1.26.0/bazelisk-linux-amd64 -O /usr/local/bin/bazel
+    chmod +x /usr/local/bin/bazel
+    bazel
+EOT
