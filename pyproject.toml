@@ -3,8 +3,10 @@ name = "bfms"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "dm-control>=1.0.31",
+]
 
 [tool.ruff]
 line-length = 100
