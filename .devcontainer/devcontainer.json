@@ -2,6 +2,7 @@
   "name": "uv",
   "build": { "dockerfile": "Dockerfile" },
   "remoteUser": "root",
+  "runArgs": ["--gpus", "all", "--shm-size", "1gb"],
   "containerEnv": {
     "SHELL": "/bin/zsh"
   },
