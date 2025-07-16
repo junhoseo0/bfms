@@ -9,9 +9,8 @@
     "vscode": {
       "extensions": [
         "ms-python.python",
-        "streetsidesoftware.code-spell-checker",
         "charliermarsh.ruff"
       ]
     }
-  },
+  }
 }
