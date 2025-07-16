@@ -11,6 +11,7 @@ wheels/
 
 # Artifacts
 datasets/
+.minari/
 
 # Vendor
 3rdparty/

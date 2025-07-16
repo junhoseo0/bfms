@@ -4,7 +4,8 @@
   "remoteUser": "root",
   "runArgs": ["--gpus", "all", "--shm-size", "1gb"],
   "containerEnv": {
-    "SHELL": "/bin/zsh"
+    "SHELL": "/bin/zsh",
+    "MINARI_DATASETS_PATH": "${localWorkspaceFolder}/.minari"
   },
   "customizations": {
     "vscode": {
