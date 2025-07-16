@@ -5,8 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "distrax>=0.1.5",
     "dm-control>=1.0.31",
+    "flax>=0.10.7",
+    "jax[cuda12]>=0.6.2",
     "numpy>=2.3.1",
+    "optax>=0.2.5",
     "tqdm>=4.67.1",
     "tyro>=0.9.26",
 ]
