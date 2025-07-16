@@ -20,7 +20,10 @@ class ExoRLDataset:
         self._np_rng = None
 
     def __len__(self):
-        return len(self._storage["observations"])
+        return len(self._storage["observation"])
+
+    def __getitem__(self, key: str) -> npt.NDArray[np.float32]:
+        return self._storage[key]
 
     def seed(self, seed: int) -> None:
         self._np_rng = np.random.default_rng(seed=seed)
