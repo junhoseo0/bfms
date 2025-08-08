@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from abc import abstractmethod
 from pathlib import Path
@@ -16,18 +17,18 @@ from bfms.interface import DMCToGym
 
 class DatasetFactory:
     _REGISTRY = {
-        "mujoco/halfcheetah/medium-v0": "D4RL",
+        "mujoco/halfcheetah/medium-v0": "MuJoCo",
         "walker/rnd": "ExoRL",
     }
 
     @staticmethod
     def create(dataset_id: str, dataset_dir: str | None = None) -> Dataset:
         dataset_group = DatasetFactory._REGISTRY.get(dataset_id)
-        if dataset_group == "D4RL":
+        if dataset_group == "MuJoCo":
             m = re.match(r"^([a-z]+)/([a-z]+)/([a-z]+)-v([0-9]+)$", dataset_id)
             assert m is not None
             group, env_id, data_quality, version = m.group(1, 2, 3, 4)
-            dataset = D4RLDataset(group, env_id, data_quality, version)
+            dataset = MuJoCoDataset(dataset_dir, group, env_id, data_quality, version)
         elif dataset_group == "ExoRL":
             if dataset_dir is None:
                 raise ValueError("dataset_dir must be given for ExoRL datasets.")
@@ -64,8 +65,9 @@ class Dataset:
         raise NotImplementedError()
 
 
-class D4RLDataset(Dataset):
-    def __init__(self, group: str, env: str, data_quality: str, version: str):
+class MuJoCoDataset(Dataset):
+    def __init__(self, dataset_dir: str, group: str, env: str, data_quality: str, version: str):
+        os.environ["MINARI_DATASETS_PATH"] = dataset_dir
         self._dataset_id = f"{group}/{env}/{data_quality}-v{version}"
         self._storage, self._env_id = self._load()
         self._np_rng = None
