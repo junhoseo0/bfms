@@ -1,20 +1,73 @@
+from __future__ import annotations
+
+import re
+from abc import abstractmethod
 from pathlib import Path
 
+import gymnasium as gym
 import minari
 import numpy as np
+from dm_control import suite
 from numpy import typing as npt
 from tqdm import tqdm
 
-DATASET_REGISTRY = {
-    "mujoco/halfcheetah/medium-v0": "D4RL",
-    "walker/rnd": "ExoRL",
-}
+from bfms.interface import DMCToGym
 
 
-class D4RLDataset:
-    def __init__(self, group: str, env: str, data_quality: str):
-        self._dataset_id = f"{group}/{env}/{data_quality}"
-        self._storage = self._load()
+class DatasetFactory:
+    _REGISTRY = {
+        "mujoco/halfcheetah/medium-v0": "D4RL",
+        "walker/rnd": "ExoRL",
+    }
+
+    @staticmethod
+    def create(dataset_id: str, dataset_dir: str | None = None) -> Dataset:
+        dataset_group = DatasetFactory._REGISTRY.get(dataset_id)
+        if dataset_group == "D4RL":
+            m = re.match(r"^([a-z]+)/([a-z]+)/([a-z]+)-v([0-9]+)$", dataset_id)
+            assert m is not None
+            group, env_id, data_quality, version = m.group(1, 2, 3, 4)
+            dataset = D4RLDataset(group, env_id, data_quality, version)
+        elif dataset_group == "ExoRL":
+            if dataset_dir is None:
+                raise ValueError("dataset_dir must be given for ExoRL datasets.")
+
+            m = re.match(r"^([a-z]+)/([a-z]+)$", dataset_id)
+            assert m is not None
+            env_id, collection_method = m.group(1, 2)
+            dataset = ExoRLDataset(dataset_dir, env_id, collection_method)
+        else:
+            raise ValueError(f"{dataset_id} is an invalid dataset.")
+
+        return dataset
+
+
+class Dataset:
+    @abstractmethod
+    def __len__(self) -> int:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def __getitem__(self, key: str) -> npt.NDArray[np.float32]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def seed(self, seed: int) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def sample(self, num_transitions: int) -> dict[str, npt.NDArray[np.float32]]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def recover_environment(self, task: str):
+        raise NotImplementedError()
+
+
+class D4RLDataset(Dataset):
+    def __init__(self, group: str, env: str, data_quality: str, version: str):
+        self._dataset_id = f"{group}/{env}/{data_quality}-v{version}"
+        self._storage, self._env_id = self._load()
         self._np_rng = None
 
     def __len__(self):
@@ -37,8 +90,25 @@ class D4RLDataset:
         batch = {key: self._storage[key][rand_indexes] for key in self._storage}
         return batch
 
-    def _load(self) -> dict[str, npt.NDArray[np.float32]]:
-        self._raw_dataset = minari.load_dataset(self._dataset_id)
+    def recover_environment(self, task: str | None = None):
+        del task
+
+        if self._env_id is None:
+            raise ValueError("env_id is not specified.")
+
+        env = gym.make(self._env_id)
+        return env
+
+    def _load(self) -> tuple[dict[str, npt.NDArray[np.float32]], str]:
+        dataset = minari.load_dataset(self._dataset_id)
+        if dataset._eval_env_spec is not None:
+            env_id = dataset._eval_env_spec.id
+        elif dataset._env_spec is not None:
+            env_id = dataset._env_spec.id
+        else:
+            # TODO: Replace with Logging
+            print(f"WARN: {self._dataset_id} doesn't provide env_id.")
+
         episodes = {
             "observation": [],
             "action": [],
@@ -46,7 +116,7 @@ class D4RLDataset:
             "reward": [],
             "terminated": [],
         }
-        for episode in tqdm(self._raw_dataset, desc="Reading Data"):
+        for episode in tqdm(dataset, desc="Reading Data"):
             episodes["observation"].append(episode.observations[:-1])
             episodes["action"].append(episode.actions)
             episodes["next_observation"].append(episode.observations[1:])
@@ -56,20 +126,21 @@ class D4RLDataset:
         storage = {}
         for key in episodes:
             storage[key] = np.concat(episodes[key], dtype=np.float32)
-        return storage
+
+        return storage, env_id
 
 
-class ExoRLDataset:
+class ExoRLDataset(Dataset):
     """
     ExoRL dataset stores transition as S_t, A_{t+1}, S_{t+1}, R_{t+1}, meaning
     that the first action and reward are always zero (vector). Also, observation
     includes the terminal observation, and the true state is given as "physics".
     """
 
-    def __init__(self, root_dir: str, env: str, collection_method: str):
-        self._env = env
+    def __init__(self, root_dir: str, domain_id: str, collection_method: str):
+        self._domain_id = domain_id
         self._collection_method = collection_method
-        self._dataset_dir = Path(root_dir) / env / collection_method / "buffer"
+        self._dataset_dir = Path(root_dir) / domain_id / collection_method / "buffer"
         self._storage = self._load()
         self._np_rng = None
 
@@ -92,6 +163,14 @@ class ExoRLDataset:
         rand_indexes = self._np_rng.integers(low=0, high=len(self), size=num_transitions)
         batch = {key: self._storage[key][rand_indexes] for key in self._storage}
         return batch
+
+    def recover_environment(self, task: str):
+        if self._domain_id is None:
+            raise ValueError("env_id is not specified.")
+
+        env = suite.load(self._domain_id, task)
+        env = DMCToGym(env)
+        return env
 
     def _load(self) -> dict[str, npt.NDArray[np.float32]]:
         episodes = {
