@@ -18,6 +18,7 @@ from bfms.interface import DMCToGym
 class DatasetFactory:
     _REGISTRY = {
         "mujoco/halfcheetah/medium-v0": "MuJoCo",
+        "mujoco/halfcheetah/expert-v0": "MuJoCo",
         "walker/rnd": "ExoRL",
     }
 
@@ -44,6 +45,16 @@ class DatasetFactory:
 
 
 class Dataset:
+    _storage: dict[str, np.ndarray]
+    _dataset_id: str
+    _min_return: float
+    _max_return: float
+
+    _TIMEOUT_LEN = {
+        "mujoco/halfcheetah/medium-v0": 1000,
+        "mujoco/halfcheetah/expert-v0": 1000,
+    }
+
     @abstractmethod
     def __len__(self) -> int:
         raise NotImplementedError()
@@ -64,12 +75,37 @@ class Dataset:
     def recover_environment(self, task: str):
         raise NotImplementedError()
 
+    @abstractmethod
+    def normalize_return(self, episodic_return: float) -> float:
+        return (episodic_return - self._min_return) / (self._max_return - self._min_return)
+
+    @property
+    @abstractmethod
+    def unwrapped(self):
+        raise NotImplementedError()
+
+    def _compute_min_max_return(self) -> tuple[float, float]:
+        starting_index = 0
+        episodic_returns = []
+        for i in range(len(self)):
+            episode_len = i - starting_index
+            if self._storage["terminated"][i] or (
+                episode_len + 1 == self._TIMEOUT_LEN[self._dataset_id]
+            ):
+                episodic_returns.append(
+                    self._storage["reward"][starting_index : starting_index + episode_len].sum()
+                )
+                starting_index = i
+
+        return np.min(episodic_returns), np.max(episodic_returns)
+
 
 class MuJoCoDataset(Dataset):
     def __init__(self, dataset_dir: str, group: str, env: str, data_quality: str, version: str):
         os.environ["MINARI_DATASETS_PATH"] = dataset_dir
         self._dataset_id = f"{group}/{env}/{data_quality}-v{version}"
         self._storage, self._env_id = self._load()
+        self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
 
     def __len__(self):
@@ -101,8 +137,11 @@ class MuJoCoDataset(Dataset):
         env = gym.make(self._env_id)
         return env
 
+    def unwrapped(self):
+        return self._storage
+
     def _load(self) -> tuple[dict[str, npt.NDArray[np.float32]], str]:
-        dataset = minari.load_dataset(self._dataset_id)
+        dataset = minari.load_dataset(self._dataset_id, download=True)
         if dataset._eval_env_spec is not None:
             env_id = dataset._eval_env_spec.id
         elif dataset._env_spec is not None:
@@ -144,6 +183,7 @@ class ExoRLDataset(Dataset):
         self._collection_method = collection_method
         self._dataset_dir = Path(root_dir) / domain_id / collection_method / "buffer"
         self._storage = self._load()
+        self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
 
     def __len__(self):
@@ -173,6 +213,9 @@ class ExoRLDataset(Dataset):
         env = suite.load(self._domain_id, task)
         env = DMCToGym(env)
         return env
+
+    def unwrapped(self):
+        return self._storage
 
     def _load(self) -> dict[str, npt.NDArray[np.float32]]:
         episodes = {
