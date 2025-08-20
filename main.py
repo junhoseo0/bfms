@@ -36,7 +36,7 @@ def main(
     dataset = DatasetFactory.create(dataset_id, dataset_dir)
     print(f"Dataset {dataset_id} loaded with {len(dataset):,} transitions.")
 
-    key = jax.random.PRNGKey(seed=seed)
+    key = jax.random.key(seed)
     key, nnx_rngs = jax.random.split(key)
     nnx_rngs = nnx.Rngs(nnx_rngs)
     dataset.seed(seed)
