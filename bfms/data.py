@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import os
 import re
+import typing
 from abc import abstractmethod
 from pathlib import Path
+from typing import Literal, overload
 
 import gymnasium as gym
 import minari
+import mujoco
 import numpy as np
 from dm_control import suite
+from dm_control.mujoco import Physics
+from dm_control.rl import control
+from dm_control.suite import base
 from numpy import typing as npt
 from tqdm import tqdm
 
@@ -19,17 +25,16 @@ class DatasetFactory:
     _REGISTRY = {
         "mujoco/halfcheetah/medium-v0": "MuJoCo",
         "mujoco/halfcheetah/expert-v0": "MuJoCo",
+        "frozenlake/random-v0": "MuJoCo",
         "walker/rnd": "ExoRL",
+        "cheetah/rnd": "ExoRL",
     }
 
     @staticmethod
     def create(dataset_id: str, dataset_dir: str | None = None) -> Dataset:
         dataset_group = DatasetFactory._REGISTRY.get(dataset_id)
         if dataset_group == "MuJoCo":
-            m = re.match(r"^([a-z]+)/([a-z]+)/([a-z]+)-v([0-9]+)$", dataset_id)
-            assert m is not None
-            group, env_id, data_quality, version = m.group(1, 2, 3, 4)
-            dataset = MuJoCoDataset(dataset_dir, group, env_id, data_quality, version)
+            dataset = MuJoCoDataset(dataset_dir, dataset_id)
         elif dataset_group == "ExoRL":
             if dataset_dir is None:
                 raise ValueError("dataset_dir must be given for ExoRL datasets.")
@@ -53,6 +58,9 @@ class Dataset:
     _TIMEOUT_LEN = {
         "mujoco/halfcheetah/medium-v0": 1000,
         "mujoco/halfcheetah/expert-v0": 1000,
+        "frozenlake/random-v0": 100,
+        "walker": 1000,
+        "cheetah": 1000,
     }
 
     @abstractmethod
@@ -72,7 +80,13 @@ class Dataset:
         raise NotImplementedError()
 
     @abstractmethod
-    def recover_environment(self, task: str):
+    def sample_with_rewards(
+        self, task_id: str, num_transitions: int
+    ) -> dict[str, npt.NDArray[np.float32]]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def recover_environment(self, task: str, gym_compatible: bool):
         raise NotImplementedError()
 
     @abstractmethod
@@ -101,9 +115,9 @@ class Dataset:
 
 
 class MuJoCoDataset(Dataset):
-    def __init__(self, dataset_dir: str, group: str, env: str, data_quality: str, version: str):
+    def __init__(self, dataset_dir: str, dataset_id: str):
         os.environ["MINARI_DATASETS_PATH"] = dataset_dir
-        self._dataset_id = f"{group}/{env}/{data_quality}-v{version}"
+        self._dataset_id = dataset_id
         self._storage, self._env_id = self._load()
         self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
@@ -137,6 +151,13 @@ class MuJoCoDataset(Dataset):
         env = gym.make(self._env_id)
         return env
 
+    def sample_with_rewards(
+        self, task_id: str, num_transitions: int
+    ) -> dict[str, npt.NDArray[np.float32]]:
+        del task_id
+
+        return self.sample(num_transitions)
+
     def unwrapped(self):
         return self._storage
 
@@ -168,6 +189,15 @@ class MuJoCoDataset(Dataset):
         for key in episodes:
             storage[key] = np.concat(episodes[key], dtype=np.float32)
 
+        if storage["observation"].ndim == 1:  # Assume discrete TODO
+            storage["observation"] = np.astype(storage["observation"], np.int32)
+            storage["next_observation"] = np.astype(storage["next_observation"], np.int32)
+        if storage["action"].ndim == 1:
+            storage["action"] = np.astype(storage["action"], np.int32)
+
+            # storage["observation"] = np.expand_dims(storage["observation"], axis=1)
+            # storage["next_observation"] = np.expand_dims(storage["next_observation"], axis=1)
+
         return storage, env_id
 
 
@@ -179,11 +209,11 @@ class ExoRLDataset(Dataset):
     """
 
     def __init__(self, root_dir: str, domain_id: str, collection_method: str):
-        self._domain_id = domain_id
+        self._dataset_id = domain_id
         self._collection_method = collection_method
         self._dataset_dir = Path(root_dir) / domain_id / collection_method / "buffer"
         self._storage = self._load()
-        self._min_return, self._max_return = self._compute_min_max_return()
+        # self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
 
     def __len__(self):
@@ -206,12 +236,44 @@ class ExoRLDataset(Dataset):
         batch = {key: self._storage[key][rand_indexes] for key in self._storage}
         return batch
 
-    def recover_environment(self, task: str):
-        if self._domain_id is None:
+    def sample_with_rewards(self, task: str, num_samples: int):
+        batch = self.sample(num_samples)
+        env = self.recover_environment(task, gym_compatible=False)
+        env._physics = typing.cast(Physics, env._physics)
+        env._task = typing.cast(base.Task, env._task)
+
+        rewards = []
+        for i in range(num_samples):
+            with env._physics.reset_context():
+                env._physics.set_state(batch["next_state"][i])
+                # Why action, not next_action?
+                env._physics.set_control(batch["action"][i])
+            mujoco.mj_forward(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
+            mujoco.mj_fwdPosition(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
+            mujoco.mj_sensorVel(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
+            mujoco.mj_subtreeVel(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
+            rewards.append(env._task.get_reward(env._physics))
+
+        batch["reward"] = np.array(rewards)
+        return batch
+
+    @overload
+    def recover_environment(self, task: str, gym_compatible: Literal[True]) -> DMCToGym: ...
+
+    @overload
+    def recover_environment(
+        self, task: str, gym_compatible: Literal[False]
+    ) -> control.Environment: ...
+
+    def recover_environment(
+        self, task: str, gym_compatible: bool = True
+    ) -> DMCToGym | control.Environment:
+        if self._dataset_id is None:
             raise ValueError("env_id is not specified.")
 
-        env = suite.load(self._domain_id, task)
-        env = DMCToGym(env)
+        env = suite.load(self._dataset_id, task, environment_kwargs={"flat_observation": True})
+        if gym_compatible:
+            env = DMCToGym(env)
         return env
 
     def unwrapped(self):
@@ -226,14 +288,17 @@ class ExoRLDataset(Dataset):
             "next_observation": [],
             "terminated": [],
         }
-        for episode_npz in tqdm(self._dataset_dir.glob("episode_*_*.npz"), desc="Reading Data"):
+
+        episode_files = list(self._dataset_dir.glob("episode_*_*.npz"))
+        for i in tqdm(range(5000), desc="Reading Data"):
+            episode_npz = episode_files[i]
             episode = np.load(episode_npz)
             episodes["state"].append(episode["physics"][:-1])
             episodes["observation"].append(episode["observation"][:-1])
             episodes["action"].append(episode["action"][1:])
             episodes["next_state"].append(episode["physics"][1:])
             episodes["next_observation"].append(episode["observation"][1:])
-            episodes["terminated"].append(1.0 - episode["discount"][:-1])
+            episodes["terminated"].append(1.0 - episode["discount"][1:])
 
         storage = {}
         for key in episodes:
