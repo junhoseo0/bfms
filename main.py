@@ -59,7 +59,6 @@ def main(
         batch_size,
     )
 
-    key, key_eval = jax.random.split(key)
     normalized_score, score, frames = fb_awr.evaluate(
         actor, fb_model, dataset, task_id, num_inference_samples, render=True
     )
@@ -90,12 +89,8 @@ def main(
         last_info = jax.tree.map(lambda x: x[-1], infos)
         print(f"{t + log_interval}: {last_info}")
 
-        # continuous_bc, _ = nnx.merge(graph_def, state)
         if (t + log_interval) % eval_interval == 0 or t == train_time_step - log_interval:
             fb_model, _, actor, _, _ = nnx.merge(graph_def, state)
-
-            key, key_eval = jax.random.split(key)
-            # with jax.disable_jit():
             normalized_score, score = fb_awr.evaluate(
                 actor, fb_model, dataset, task_id, num_inference_samples, render=False
             )
