@@ -5,7 +5,7 @@ import re
 import typing
 from abc import abstractmethod
 from pathlib import Path
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 import gymnasium as gym
 import minari
@@ -15,7 +15,7 @@ from dm_control import suite
 from dm_control.mujoco import Physics
 from dm_control.rl import control
 from dm_control.suite import base
-from numpy import typing as npt
+from jaxtyping import Float
 from tqdm import tqdm
 
 from bfms.interface import DMCToGym
@@ -49,8 +49,24 @@ class DatasetFactory:
         return dataset
 
 
+class Batch(NamedTuple):
+    observation: Float[np.ndarray, "batch ..."]
+    action: Float[np.ndarray, "batch ..."]
+    next_observation: Float[np.ndarray, "batch ..."]
+    terminated: Float[np.ndarray, "batch ..."]
+
+
+class BatchWithReward(NamedTuple):
+    observation: Float[np.ndarray, "batch ..."]
+    action: Float[np.ndarray, "batch ..."]
+    next_observation: Float[np.ndarray, "batch ..."]
+    terminated: Float[np.ndarray, "batch ..."]
+    reward: Float[np.ndarray, "batch ..."] | dict[str, Float[np.ndarray, "batch ..."]]
+
+
 class Dataset:
-    _storage: dict[str, np.ndarray]
+    tasks: list[str]
+    _storage: dict[str, Float[np.ndarray, "dataset ..."]]
     _dataset_id: str
     _min_return: float
     _max_return: float
@@ -68,82 +84,105 @@ class Dataset:
         raise NotImplementedError()
 
     @abstractmethod
-    def __getitem__(self, key: str) -> npt.NDArray[np.float32]:
+    def __getitem__(self, key: str) -> Float[np.ndarray, "dataset ..."]:
         raise NotImplementedError()
 
     @abstractmethod
     def seed(self, seed: int) -> None:
         raise NotImplementedError()
 
+    @overload
+    def sample(self, size: int, with_reward: Literal[False]) -> Batch: ...
+
+    @overload
+    def sample(self, size: int, with_reward: Literal[True]) -> BatchWithReward: ...
+
+    @overload
+    def sample(self, size: int) -> Batch: ...
+
     @abstractmethod
-    def sample(self, num_transitions: int) -> dict[str, npt.NDArray[np.float32]]:
+    def sample(self, size: int, with_reward: bool = False) -> Batch | BatchWithReward:
         raise NotImplementedError()
 
     @abstractmethod
-    def sample_with_rewards(
-        self, task_id: str, num_transitions: int
-    ) -> dict[str, npt.NDArray[np.float32]]:
+    def get_rewards(
+        self,
+        task_id: str,
+        actions: Float[np.ndarray, "batch action"],
+        next_observations: Float[np.ndarray, "batch obs"],
+    ) -> Float[np.ndarray, " batch"]:
         raise NotImplementedError()
 
-    @abstractmethod
-    def recover_environment(self, task: str, gym_compatible: bool):
-        raise NotImplementedError()
+    @overload
+    def recover_environment(self, task: str, gym_compatible: Literal[True]) -> DMCToGym: ...
+
+    @overload
+    def recover_environment(
+        self, task: str, gym_compatible: Literal[False]
+    ) -> control.Environment: ...
+
+    @overload
+    def recover_environment(self, task: str) -> DMCToGym: ...
 
     @abstractmethod
-    def normalize_return(self, episodic_return: float) -> float:
-        return (episodic_return - self._min_return) / (self._max_return - self._min_return)
+    def recover_environment(self, task: str, gym_compatible: bool = True):
+        raise NotImplementedError()
 
     @property
     @abstractmethod
     def unwrapped(self):
         raise NotImplementedError()
 
-    def _compute_min_max_return(self) -> tuple[float, float]:
-        starting_index = 0
-        episodic_returns = []
-        for i in range(len(self)):
-            episode_len = i - starting_index
-            if self._storage["terminated"][i] or (
-                episode_len + 1 == self._TIMEOUT_LEN[self._dataset_id]
-            ):
-                episodic_returns.append(
-                    self._storage["reward"][starting_index : starting_index + episode_len].sum()
-                )
-                starting_index = i
-
-        return np.min(episodic_returns), np.max(episodic_returns)
-
 
 class MuJoCoDataset(Dataset):
-    def __init__(self, dataset_dir: str, dataset_id: str):
-        os.environ["MINARI_DATASETS_PATH"] = dataset_dir
+    def __init__(self, dataset_dir: str | None, dataset_id: str):
+        if dataset_dir is not None:
+            os.environ["MINARI_DATASETS_PATH"] = dataset_dir
         self._dataset_id = dataset_id
         self._storage, self._env_id = self._load()
-        self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
 
-    def __len__(self):
+        self.tasks = [dataset_id]
+
+    def __len__(self) -> int:
         return len(self._storage["observation"])
 
-    def __getitem__(self, key: str) -> npt.NDArray[np.float32]:
+    def __getitem__(self, key: str) -> Float[np.ndarray, "{dataset} ..."]:
         return self._storage[key]
 
     def seed(self, seed: int) -> None:
         self._np_rng = np.random.default_rng(seed)
 
-    def sample(self, num_transitions: int) -> dict[str, npt.NDArray[np.float32]]:
+    def sample(self, size: int, with_reward: bool = False) -> Batch | BatchWithReward:
         if self._np_rng is None:
             # 294 is my favorite number.
             self.seed(seed=294)
-
         assert self._np_rng is not None
 
-        rand_indexes = self._np_rng.integers(low=0, high=len(self), size=num_transitions)
-        batch = {key: self._storage[key][rand_indexes] for key in self._storage}
+        rand_indexes = self._np_rng.integers(low=0, high=len(self), size=size)
+        batch = Batch(
+            observation=self._storage["observation"][rand_indexes],
+            action=self._storage["action"][rand_indexes],
+            next_observation=self._storage["next_observation"][rand_indexes],
+            terminated=self._storage["terminated"][rand_indexes],
+        )
+        if with_reward:
+            batch = BatchWithReward(*batch, reward=self._storage["reward"][rand_indexes])
         return batch
 
-    def recover_environment(self, task: str | None = None):
+    def get_rewards(
+        self,
+        task: str,
+        actions: Float[np.ndarray, "batch action"],
+        next_observations: Float[np.ndarray, "batch ..."],
+    ) -> Float[np.ndarray, " batch"]:
+        raise NotImplementedError("MuJoCo dataset does not support reward inference.")
+
+    def recover_environment(self, task: str | None = None, gym_compatible: bool = True) -> gym.Env:
         del task
+
+        if not gym_compatible:
+            raise ValueError("MuJoCo dataset only supports Gym environment.")
 
         if self._env_id is None:
             raise ValueError("env_id is not specified.")
@@ -151,17 +190,12 @@ class MuJoCoDataset(Dataset):
         env = gym.make(self._env_id)
         return env
 
-    def sample_with_rewards(
-        self, task_id: str, num_transitions: int
-    ) -> dict[str, npt.NDArray[np.float32]]:
-        del task_id
-
-        return self.sample(num_transitions)
-
-    def unwrapped(self):
+    def unwrapped(self) -> dict[str, Float[np.ndarray, "dataset ..."]]:
         return self._storage
 
-    def _load(self) -> tuple[dict[str, npt.NDArray[np.float32]], str]:
+    def _load(
+        self,
+    ) -> tuple[dict[str, Float[np.ndarray, "dataset ..."]], str]:
         dataset = minari.load_dataset(self._dataset_id, download=True)
         if dataset._eval_env_spec is not None:
             env_id = dataset._eval_env_spec.id
@@ -188,16 +222,6 @@ class MuJoCoDataset(Dataset):
         storage = {}
         for key in episodes:
             storage[key] = np.concat(episodes[key], dtype=np.float32)
-
-        if storage["observation"].ndim == 1:  # Assume discrete TODO
-            storage["observation"] = np.astype(storage["observation"], np.int32)
-            storage["next_observation"] = np.astype(storage["next_observation"], np.int32)
-        if storage["action"].ndim == 1:
-            storage["action"] = np.astype(storage["action"], np.int32)
-
-            # storage["observation"] = np.expand_dims(storage["observation"], axis=1)
-            # storage["next_observation"] = np.expand_dims(storage["next_observation"], axis=1)
-
         return storage, env_id
 
 
@@ -213,49 +237,66 @@ class ExoRLDataset(Dataset):
         self._collection_method = collection_method
         self._dataset_dir = Path(root_dir) / domain_id / collection_method / "buffer"
         self._storage = self._load()
-        # self._min_return, self._max_return = self._compute_min_max_return()
         self._np_rng = None
+
+        self.tasks: tuple[str, ...] = suite.TASKS_BY_DOMAIN[domain_id]
 
     def __len__(self):
         return len(self._storage["observation"])
 
-    def __getitem__(self, key: str) -> npt.NDArray[np.float32]:
+    def __getitem__(self, key: str) -> Float[np.ndarray, "dataset ..."]:
         return self._storage[key]
 
     def seed(self, seed: int) -> None:
         self._np_rng = np.random.default_rng(seed=seed)
 
-    def sample(self, num_transitions: int) -> dict[str, npt.NDArray[np.float32]]:
+    def sample(self, size: int, with_reward: bool = False) -> Batch | BatchWithReward:
         if self._np_rng is None:
             # 294 is my favorite number.
             self.seed(seed=294)
-
         assert self._np_rng is not None
 
-        rand_indexes = self._np_rng.integers(low=0, high=len(self), size=num_transitions)
-        batch = {key: self._storage[key][rand_indexes] for key in self._storage}
+        rand_indexes = self._np_rng.integers(low=0, high=len(self), size=size)
+        batch = Batch(
+            observation=self._storage["observation"][rand_indexes],
+            action=self._storage["action"][rand_indexes],
+            next_observation=self._storage["next_observation"][rand_indexes],
+            terminated=self._storage["terminated"][rand_indexes],
+        )
+        if with_reward:
+            reward = {
+                task: self.get_rewards(task, batch.action, batch.next_observation)
+                for task in self.tasks
+            }
+            batch = BatchWithReward(*batch, reward=reward)
+
         return batch
 
-    def sample_with_rewards(self, task: str, num_samples: int):
-        batch = self.sample(num_samples)
+    def get_rewards(
+        self,
+        task: str,
+        actions: Float[np.ndarray, "batch action"],
+        next_observations: Float[np.ndarray, "batch obs"],
+    ) -> Float[np.ndarray, " batch"]:
         env = self.recover_environment(task, gym_compatible=False)
         env._physics = typing.cast(Physics, env._physics)
         env._task = typing.cast(base.Task, env._task)
 
         rewards = []
-        for i in range(num_samples):
+        size = next_observations.shape[0]
+        for i in range(size):
             with env._physics.reset_context():
-                env._physics.set_state(batch["next_state"][i])
-                # Why action, not next_action?
-                env._physics.set_control(batch["action"][i])
+                env._physics.set_state(next_observations[i])
+                env._physics.set_control(actions[i])
             mujoco.mj_forward(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
             mujoco.mj_fwdPosition(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
             mujoco.mj_sensorVel(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
             mujoco.mj_subtreeVel(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
-            rewards.append(env._task.get_reward(env._physics))
+            reward = typing.cast(float, env._task.get_reward(env._physics))
+            rewards.append(reward)
 
-        batch["reward"] = np.array(rewards)
-        return batch
+        rewards = np.array(rewards, dtype=np.float32)
+        return rewards
 
     @overload
     def recover_environment(self, task: str, gym_compatible: Literal[True]) -> DMCToGym: ...
@@ -264,6 +305,9 @@ class ExoRLDataset(Dataset):
     def recover_environment(
         self, task: str, gym_compatible: Literal[False]
     ) -> control.Environment: ...
+
+    @overload
+    def recover_environment(self, task: str) -> DMCToGym: ...
 
     def recover_environment(
         self, task: str, gym_compatible: bool = True
@@ -279,7 +323,7 @@ class ExoRLDataset(Dataset):
     def unwrapped(self):
         return self._storage
 
-    def _load(self) -> dict[str, npt.NDArray[np.float32]]:
+    def _load(self) -> dict[str, Float[np.ndarray, "dataset ..."]]:
         episodes = {
             "state": [],
             "observation": [],

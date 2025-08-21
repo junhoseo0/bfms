@@ -10,6 +10,7 @@ from flax import nnx
 from jax import numpy as jnp
 
 from bfms.data import Dataset
+from bfms.typing import Image
 
 
 def _project_latent(latent: jax.Array) -> jax.Array:
@@ -444,10 +445,10 @@ def evaluate(
     actor: GaussianActor,
     fb_model: ForwardBackwardModel,
     dataset: Dataset,
-    task_id: str,
     num_inference_samples: int,
-    render: Literal[True],
-) -> tuple[float, float, list[np.ndarray]]: ...
+    tasks: list[str] | None = None,
+    render: Literal[True] = True,
+) -> dict[str, dict[str, float] | dict[str, list[Image]]]: ...
 
 
 @overload
@@ -455,53 +456,64 @@ def evaluate(
     actor: GaussianActor,
     fb_model: ForwardBackwardModel,
     dataset: Dataset,
-    task_id: str,
     num_inference_samples: int,
-    render: Literal[False],
-) -> tuple[float, float]: ...
+    tasks: list[str] | None = None,
+    render: Literal[False] = False,
+) -> dict[str, dict[str, float]]: ...
+
+
+@overload
+def evaluate(
+    actor: GaussianActor,
+    fb_model: ForwardBackwardModel,
+    dataset: Dataset,
+    num_inference_samples: int,
+    tasks: list[str] | None = None,
+) -> dict[str, dict[str, float]]: ...
 
 
 def evaluate(
     actor: GaussianActor,
     fb_model: ForwardBackwardModel,
     dataset: Dataset,
-    task_id: str,
     num_inference_samples: int,
+    tasks: list[str] | None = None,
     render: bool = False,
-) -> tuple[float, float] | tuple[float, float, list[np.ndarray]]:
-    env = dataset.recover_environment(task_id, gym_compatible=True)
-    batch = dataset.sample_with_rewards(task_id, num_inference_samples)
-    batch = jax.tree.map(jnp.asarray, batch)
-    latent = infer_latent(fb_model, batch["next_observation"], batch["reward"])
+) -> dict[str, dict[str, float]] | dict[str, dict[str, float] | dict[str, list[Image]]]:
+    if tasks is None:
+        tasks = dataset.tasks
 
-    score = 0.0
-    done = False
-    frames = []
-    observation, _ = env.reset()
+    result = {"score": {}}
+    if render:
+        result["render"] = {}
 
-    # Estimate Q.
-    action = act(actor, observation, latent)
+    for task in tasks:
+        env = dataset.recover_environment(task)
 
-    f1 = fb_model.embed_forward1(jnp.asarray(observation), action, latent)
-    f2 = fb_model.embed_forward2(jnp.asarray(observation), action, latent)
-    q1 = (f1 * latent).sum(axis=-1)
-    q2 = (f2 * latent).sum(axis=-1)
-    q = (q1 + q2) / 2.0
-    print(f"estimated {q=}")
+        # Infer latents.
+        batch = dataset.sample(num_inference_samples, with_reward=True)
+        batch = jax.tree.map(jnp.asarray, batch)
+        latent = infer_latent(fb_model, batch["next_observation"], batch["reward"])
 
-    while not done:
+        score = 0.0
+        frames = []
+        observation, _ = env.reset()
+        terminated, truncated = False, False
+        while not (terminated or truncated):
+            if render:
+                frame = env.render()
+                frames.append(frame)
+
+            action = act(actor, observation, latent)
+            observation, reward, terminated, truncated, _ = env.step(np.asarray(action))
+            score += float(reward)
+
         if render:
             frame = env.render()
             frames.append(frame)
 
-        action = act(actor, observation, latent)
-        observation, reward, terminated, truncated, _ = env.step(np.asarray(action))
-        done = terminated or truncated
-        score += float(reward)
+        result["score"][task] = score
+        if render:
+            result["render"][task] = frames
 
-    if render:
-        frame = env.render()
-        frames.append(frame)
-        return score, score, frames
-
-    return score, score
+    return result

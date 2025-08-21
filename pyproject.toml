@@ -11,6 +11,7 @@ dependencies = [
     "gymnasium>=1.2.0",
     "imageio>=2.37.0",
     "jax[cuda12]<0.7.0",
+    "jaxtyping>=0.3.2",
     "minari[all]>=0.5.3",
     "numpy>=2.3.1",
     "optax>=0.2.5",
@@ -21,3 +22,6 @@ dependencies = [
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+ignore = ["F722"]
