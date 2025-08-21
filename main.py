@@ -22,7 +22,8 @@ from imageio import v3 as iio
 from jax import numpy as jnp
 
 from bfms.data import DatasetFactory
-from bfms.fb import continuous as fb_awr
+from bfms.fb import continuous as fb
+from bfms.logging import RecordWriter
 
 
 def log_result(result, step: int) -> None:
@@ -37,7 +38,7 @@ def main(
     seed: int = 294,
     train_time_step: int = int(1e6),
     batch_size: int = 1024,
-    num_inference_samples: int = 50_000,
+    num_reward_samples: int = 50_000,
     device_num: int = 0,
     log_interval: int = 10_000,
     eval_interval: int = 100_000,
@@ -59,50 +60,50 @@ def main(
     # TODO: Move this to config.
     dim_latent = 100
 
-    fb_model = fb_awr.ForwardBackwardModel(dim_state, dim_action, dim_latent, rngs=nnx_rngs)
+    fb_model = fb.ForwardBackwardModel(dim_state, dim_action, dim_latent, rngs=nnx_rngs)
     target_fb_model = nnx.clone(fb_model)
     fb_optimizer = nnx.Optimizer(fb_model, optax.adam(1e-4), wrt=nnx.Param)
 
-    actor = fb_awr.GaussianActor(-1.0, 1.0, dim_state, dim_action, dim_latent, rngs=nnx_rngs)
+    actor = fb.GaussianActor(-1.0, 1.0, dim_state, dim_action, dim_latent, rngs=nnx_rngs)
     actor_optimizer = nnx.Optimizer(actor, optax.adam(1e-4), wrt=nnx.Param)
 
-    result = fb_awr.evaluate(actor, fb_model, dataset, num_inference_samples, render=True)
-    log_result(result, 0)
-
-    s_time = time.perf_counter()
-    train_state = fb_awr.TrainState(
+    train_state = fb.TrainState(
         fb_model, target_fb_model, actor, fb_optimizer, actor_optimizer, key
     )
-    train_step = fb_awr.make_train_step(
-        fb_awr.TrainConfig(actor_stddev=0.2, discount=0.98, dim_latent=dim_latent),
+    train_step = fb.make_train_step(
+        fb.TrainConfig(actor_stddev=0.2, discount=0.98, dim_latent=dim_latent),
         batch_size,
         log_interval,
     )
     train_step = nnx.cached_partial(train_step, train_state)
 
+    logger = RecordWriter()
     for t in range(0, train_time_step, log_interval):
+        if t % eval_interval == 0:
+            result = fb.evaluate(
+                train_state.actor, train_state.fb_model, dataset, num_reward_samples, render=True
+            )
+            log_result(result, t)
+
         batches = dataset.sample(log_interval * batch_size)
         batches = jax.tree.map(lambda x: x.reshape(log_interval, batch_size, x.shape[-1]), batches)
         batches = jax.tree.map(jnp.asarray, batches)
 
-        train_state, infos = train_step(batches)
+        s_time = time.perf_counter()
+        train_state, metrics = train_step(batches)
         elapsed_time = time.perf_counter() - s_time
         expected_time = (train_time_step // log_interval) * elapsed_time
-
         print(
             f"{t + log_interval}: {elapsed_time / log_interval:.3f}s/update",
             f"(interval: {elapsed_time:.2f}s / expected total: {datetime.timedelta(seconds=expected_time)})",
         )
-        s_time = time.perf_counter()
 
-        last_info = jax.tree.map(lambda x: x[-1], infos)
-        print(f"{t + log_interval}: {last_info}")
+        logger(metrics, (t + log_interval))
 
-        if (t + log_interval) % eval_interval == 0 or t == train_time_step - log_interval:
-            result = fb_awr.evaluate(
-                train_state.actor, train_state.fb_model, dataset, num_inference_samples, render=True
-            )
-            log_result(result, t + log_interval)
+    result = fb.evaluate(
+        train_state.actor, train_state.fb_model, dataset, num_reward_samples, render=True
+    )
+    log_result(result, t + log_interval)
 
 
 if __name__ == "__main__":
