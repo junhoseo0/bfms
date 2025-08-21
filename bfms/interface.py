@@ -19,16 +19,15 @@ class DMCToGym:
         timestep = self._dmc_env.step(action)
         return (
             timestep.observation["observations"],
-            # self._concat_observation(timestep.observation),
             timestep.reward,
-            timestep.last(),  # Termination
-            False,  # Truncation
+            timestep.last(),
+            False,
             {},
         )
 
     def render(self) -> np.ndarray:
         self._dmc_env._physics = typing.cast(Physics, self._dmc_env._physics)
-        return self._dmc_env._physics.render()
+        return self._dmc_env._physics.render(camera_id=0)
 
     def _concat_observation(self, observation: dict[str, np.ndarray]):
         obs_concated = jax.tree.map(lambda x: jnp.atleast_1d(x), observation)
