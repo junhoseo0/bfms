@@ -1,11 +1,9 @@
 import functools
-import typing
-from typing import Any, Literal, NamedTuple, overload
+from typing import Literal, NamedTuple, overload
 
 import distrax
 import jax
 import numpy as np
-import optax
 from flax import nnx
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
@@ -70,6 +68,16 @@ class ForwardModel(nnx.Module):
         state_latent_emb = self._embed_s_z(state_latent)
         x = jnp.concat((state_action_emb, state_latent_emb), axis=-1)
         return self._embed_forward(x)
+
+
+@functools.partial(nnx.vmap, in_axes=(0, None, None, None))
+def ensemble_forward(
+    model: ForwardModel,
+    state: Float[Array, "*batch {model._dim_state}"],
+    action: Float[Array, "*batch {model._dim_action}"],
+    latent: Float[Array, "*batch {model._dim_lantent}"],
+) -> Float[Array, "*batch {model._dim_latent}"]:
+    return model(state, action, latent)
 
 
 class BackwardModel(nnx.Module):
@@ -238,16 +246,25 @@ class ForwardBackwardModel(nnx.Module):
         dim_state: int,
         dim_action: int,
         dim_latent: int,
+        num_ensemble: int = 2,
         *,
         rngs: nnx.Rngs,
     ):
+        if num_ensemble < 2:
+            raise ValueError(f"Number of ensembles must be 2 or more, but received {num_ensemble}.")
+
+        @nnx.split_rngs(splits=num_ensemble)
+        @nnx.vmap
+        def _make_ensemble(rngs: nnx.Rngs):
+            return ForwardModel(dim_state, dim_action, dim_latent, rngs=rngs)
+
+        self._num_ensemble = num_ensemble
         self._dim_state = dim_state
         self._dim_action = dim_action
         self._dim_latent = dim_latent
 
         # TODO: Replace with customizable number of ensembles, possibly with nnx.vmap.
-        self.embed_forward1 = ForwardModel(dim_state, dim_action, dim_latent, rngs=rngs)
-        self.embed_forward2 = ForwardModel(dim_state, dim_action, dim_latent, rngs=rngs)
+        self.embed_forwards = _make_ensemble(rngs)
         self.embed_backward = BackwardModel(dim_state, dim_latent, rngs=rngs)
 
     def __call__(
@@ -257,14 +274,12 @@ class ForwardBackwardModel(nnx.Module):
         latent: Float[Array, "*batch {self._dim_latent}"],
         future_state: Float[Array, "*batch {self._dim_state}"],
     ) -> tuple[
-        Float[Array, "*batch {self._dim_latent}"],
-        Float[Array, "*batch {self._dim_latent}"],
+        Float[Array, "{self._num_ensemble} *batch {self._dim_latent}"],
         Float[Array, "*batch {self._dim_latent}"],
     ]:
-        forward_emb1 = self.embed_forward1(state, action, latent)
-        forward_emb2 = self.embed_forward2(state, action, latent)
+        forward_embs = ensemble_forward(self.embed_forwards, state, action, latent)
         backward_emb = self.embed_backward(future_state)
-        return forward_emb1, forward_emb2, backward_emb
+        return forward_embs, backward_emb
 
 
 class TrainConfig(NamedTuple):
@@ -296,6 +311,7 @@ def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
         train_state: TrainState, batch: BatchJAX
     ) -> tuple[TrainState, dict[str, Float[Array, "1"]]]:
         fb_model, target_fb_model, actor, fb_optimizer, actor_optimizer, key = train_state
+        observation, action, next_observation, terminated = batch
 
         key, key_latent_ball = jax.random.split(key)
         # # Sample z's from uniformly from the Euclidean ball of radius \sqrt{d}
@@ -307,67 +323,44 @@ def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
         # # Sample z from B(s); this is equivalent to sampling random goals.
         key, key_latent_goal = jax.random.split(key)
         permuted_index = jax.random.permutation(key_latent_goal, batch_size)
-        latent_goal = fb_model.embed_backward(batch.next_observation[permuted_index])
+        latent_goal = fb_model.embed_backward(next_observation[permuted_index])
 
         # # Mix two latents.
         # # TODO: Move to option.
         key, key_mask = jax.random.split(key)
         random_mask = jax.random.uniform(key_mask, (batch_size, 1)) < 0.5
         latent = jnp.where(random_mask, latent_goal, latent_ball)
-        # latent = batch["latent"]
 
         # Compute the target FB.
         # We can use multiple options for the future state, and the next
         # state is one version of them. TODO: Implement other options.
         key, key_next_action = jax.random.split(key)
-        next_action_dist = actor(batch.next_observation, latent, config.actor_stddev, 0.3)
+        next_action_dist = actor(next_observation, latent, config.actor_stddev, 0.3)
         next_action = next_action_dist.sample(seed=key_next_action)
-        next_f_emb1, next_f_emb2, next_b_emb = target_fb_model(
-            batch.next_observation, next_action, latent, batch.next_observation
+        next_f_embs, next_b_emb = target_fb_model(
+            next_observation, next_action, latent, next_observation
         )
-        # s: source (= batch size), t: target (= batch size), d: latent dimension.
-        next_measures1 = jnp.einsum("sd,td->st", next_f_emb1, next_b_emb)
-        next_measures2 = jnp.einsum("sd,td->st", next_f_emb2, next_b_emb)
-        next_measures = (next_measures1 + next_measures2) / 2.0
+        # p: parallel, s: source (= batch size), t: target (= batch size), d: latent dimension.
+        next_measures = jnp.einsum("psd,td->pst", next_f_embs, next_b_emb)
+        next_measure = jnp.mean(next_measures, axis=0)
 
         # Prepare key for sampling on-policy actions.
         key, key_action = jax.random.split(key)
 
-        # There's a two approach to handling the loss function that incorporates
-        # outputs from multiple model:
-        # 1) Use separate loss functions for each model, with the hopes that
-        # jax.jit optimizes computational graph to avoid re-compute
-        # (ref.: https://github.com/google/flax/discussions/3316#discussioncomment-6968965)
-        # 2) Add another module that includes all the required model
-        # (ref.: https://github.com/google/flax/blob/main/examples/nnx_toy_examples/05_vae.py)
-        # TODO: Write about reasoning to choose the option 2).
         def fb_loss_fn(fb_model: ForwardBackwardModel) -> tuple[jax.Array, dict[str, jax.Array]]:
-            f_emb1, f_emb2, b_emb = fb_model(
-                batch.observation, batch.action, latent, batch.next_observation
-            )
-            measures1 = jnp.einsum("sd,td->st", f_emb1, b_emb)
-            measures2 = jnp.einsum("sd,td->st", f_emb2, b_emb)
+            f_embs, b_emb = fb_model(observation, action, latent, next_observation)
+            measures = jnp.einsum("psd,td->pst", f_embs, b_emb)
 
             # Compute FB loss.
             off_diag = ~jnp.eye(batch_size, batch_size, dtype=jnp.bool)
-            diff_measures1 = measures1 - config.discount * next_measures
-            diff_measures2 = measures2 - config.discount * next_measures
-            loss_fb_off_diag = 0.5 * (
-                jnp.where(off_diag, diff_measures1**2, 0.0).sum() / off_diag.sum()
-                + jnp.where(off_diag, diff_measures2**2, 0.0).sum() / off_diag.sum()
-            )
-            loss_fb_diag = -(diff_measures1.diagonal().mean() + diff_measures2.diagonal().mean())
+            diff_measures = measures - config.discount * next_measure
+            loss_fb_off_diag = 0.5 * ((diff_measures * off_diag) ** 2).sum() / off_diag.sum()
+            loss_fb_diag = -diff_measures.shape[0] * diff_measures.diagonal(axis1=1, axis2=2).mean()
             loss_fb = loss_fb_off_diag + loss_fb_diag
 
             # Compute orthogonal regularization.
-            # NOTE: There are two versions of this regularization, one involing
-            # stop-gradients operator (Touati & Ollivier, 2021, p.14) and the
-            # without it (Cetin et al., 2024, p.28). This version implements the
-            # second one. TODO: Make it optional.
-            b_gram = jnp.matmul(b_emb, b_emb.T)  # (B, B)
-            loss_orthonormal_off_diag = (
-                0.5 * jnp.where(off_diag, b_gram**2, 0.0).sum() / off_diag.sum()
-            )
+            b_gram = jnp.matmul(b_emb, b_emb.T)
+            loss_orthonormal_off_diag = 0.5 * ((b_gram * off_diag) ** 2).sum() / off_diag.sum()
             loss_orthonormal_diag = -b_gram.diagonal().mean()
             loss_orthonormal = loss_orthonormal_off_diag + loss_orthonormal_diag
 
@@ -380,51 +373,37 @@ def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
                 "loss_orthonormal": loss_orthonormal,
                 "loss_orthonormal_diag": loss_orthonormal_diag,
                 "loss_orthonormal_off_diag": loss_orthonormal_off_diag,
-                "measure1": measures1.mean(),
-                "next_measure": next_measures.mean(),
-                "f_emb1": f_emb1.mean(),
-                "b_emb": b_emb.mean(),
-                "b_norm": jnp.linalg.norm(b_emb, ord=2, axis=-1).mean(),
-                "z_norm": jnp.linalg.norm(latent, ord=2, axis=-1).mean(),
             }
 
         def actor_loss_fn(
-            actor: GaussianActor, fb_model: ForwardBackwardModel
+            actor: GaussianActor, forward_model: ForwardModel
         ) -> tuple[jax.Array, dict[str, jax.Array]]:
             # Compute actor loss.
             # TODO: Implement improved weighted importance sampling (IWIS)
             action_dist = actor(batch.observation, latent, config.actor_stddev, 0.3)
-            action = action_dist.sample(seed=key_action)
+            onpolicy_action = action_dist.sample(seed=key_action)
 
-            f_emb1 = fb_model.embed_forward1(batch.observation, action, latent)
-            f_emb2 = fb_model.embed_forward2(batch.observation, action, latent)
-            q1 = (f_emb1 * latent).sum(axis=-1)
-            q2 = (f_emb2 * latent).sum(axis=-1)
+            f_embs = ensemble_forward(forward_model, observation, onpolicy_action, latent)
+            qs = (f_embs * latent).sum(axis=-1)
 
             # Compute the uncertainty.
-            qs = jnp.concat([jnp.expand_dims(q1, 0), jnp.expand_dims(q2, 0)], axis=0)  # (2, B)
             qs_left = jnp.expand_dims(qs, axis=0)
             qs_right = jnp.expand_dims(qs, axis=1)
             qs_diffs = jnp.abs(qs_left - qs_right)
             q_uncertainty = qs_diffs.sum(axis=(0, 1)) / 2
 
             # Compute uncertainty-penalized Q.
-            q = qs.mean(axis=0) - 0.5 * q_uncertainty  # B
+            q = qs.mean(axis=0) - 0.5 * q_uncertainty
             loss = -q.mean()
             return loss, {"loss_actor": loss, "q": q.mean(), "q_uncertainty": q_uncertainty.mean()}
 
-        (_, info_fb), grad = nnx.value_and_grad(fb_loss_fn, has_aux=True)(fb_model)
+        (_, metrics_fb), grad = nnx.value_and_grad(fb_loss_fn, has_aux=True)(fb_model)
         fb_optimizer.update(fb_model, grad)
 
-        f1_grad_norm = optax.global_norm(grad["embed_forward1"])
-        f2_grad_norm = optax.global_norm(grad["embed_forward2"])
-        b_grad_norm = optax.global_norm(grad["embed_backward"])
-
-        (_, info_actor), grad = nnx.value_and_grad(actor_loss_fn, argnums=0, has_aux=True)(
-            actor, fb_model
+        (_, metrics_actor), grad = nnx.value_and_grad(actor_loss_fn, argnums=0, has_aux=True)(
+            actor, fb_model.embed_forwards
         )
         actor_optimizer.update(actor, grad)
-        actor_grad_norm = optax.global_norm(grad)
 
         # Perform soft-update on the target networks.
         fb_params = nnx.state(fb_model, nnx.Param)
@@ -436,12 +415,7 @@ def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
 
         return TrainState(
             fb_model, target_fb_model, actor, fb_optimizer, actor_optimizer, key
-        ), info_fb | info_actor | {
-            "f1_global_norm": f1_grad_norm,
-            "f2_global_norm": f2_grad_norm,
-            "b_global_norm": b_grad_norm,
-            "actor_grad_norm": actor_grad_norm,
-        }
+        ), metrics_fb | metrics_actor
 
     return _train_step
 
