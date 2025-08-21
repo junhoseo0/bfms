@@ -14,7 +14,7 @@ from bfms.data import Dataset
 from bfms.typing import Image
 
 
-def _project_latent(latent: jax.Array) -> jax.Array:
+def _project_latent(latent: Float[Array, "*batch dim"]) -> Float[Array, "*batch dim"]:
     l2_norm: jax.Array = jnp.linalg.norm(latent, ord=2, axis=-1, keepdims=True)
     return jnp.sqrt(latent.shape[-1]) * latent / l2_norm
 
@@ -30,6 +30,10 @@ class ForwardModel(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
+        self._dim_state = dim_state
+        self._dim_action = dim_action
+        self._dim_latent = dim_latent
+
         self._embed_s_a = nnx.Sequential(
             nnx.Linear(dim_state + dim_action, dim_hidden, rngs=rngs),
             # TODO: Fill in the reasoning about LayerNorm; if I remember
@@ -50,16 +54,16 @@ class ForwardModel(nnx.Module):
 
         seq_layers = []
         for _ in range(num_hidden):
-            seq_layers.extend(
-                [
-                    nnx.Linear(dim_hidden, dim_hidden, rngs=rngs),
-                    nnx.relu,
-                ]
-            )
+            seq_layers.extend([nnx.Linear(dim_hidden, dim_hidden, rngs=rngs), nnx.relu])
         seq_layers.append(nnx.Linear(dim_hidden, dim_latent, rngs=rngs))
         self._embed_forward = nnx.Sequential(*seq_layers)
 
-    def __call__(self, state: jax.Array, action: jax.Array, latent: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        state: Float[Array, "*batch {self._dim_state}"],
+        action: Float[Array, "*batch {self._dim_action}"],
+        latent: Float[Array, "*batch {self._dim_latent}"],
+    ) -> Float[Array, "*batch {self._dim_latent}"]:
         state_action = jnp.concat((state, action), axis=-1)
         state_action_emb = self._embed_s_a(state_action)
         state_latent = jnp.concat((state, latent), axis=-1)
@@ -74,11 +78,12 @@ class BackwardModel(nnx.Module):
         dim_state: int,
         dim_latent: int,
         dim_hidden: int = 256,
-        num_hidden: int = 2,
+        num_hidden: int = 1,
         normalize_latent: bool = True,
         *,
         rngs: nnx.Rngs,
     ):
+        self._dim_state = dim_state
         self._dim_latent = dim_latent
         self._normalize_latent = normalize_latent
 
@@ -87,15 +92,15 @@ class BackwardModel(nnx.Module):
             nnx.LayerNorm(dim_hidden, rngs=rngs),
             nnx.tanh,
         ]
-        # TODO: Why do we `-1` here?
-        for _ in range(num_hidden - 1):
+        for _ in range(num_hidden):
             seq_layers.extend([nnx.Linear(dim_hidden, dim_hidden, rngs=rngs), nnx.relu])
         seq_layers.append(nnx.Linear(dim_hidden, dim_latent, rngs=rngs))
         self._embed_backward = nnx.Sequential(*seq_layers)
 
-    # Backward model can be also be implemented for (s, a).
     # TODO: Implement Backward model for (s, a).
-    def __call__(self, state: jax.Array) -> jax.Array:
+    def __call__(
+        self, state: Float[Array, "*batch {self._dim_state}"]
+    ) -> Float[Array, "*batch {self._dim_latent}"]:
         backward_emb = self._embed_backward(state)
         # TODO: Make the normalization optional.
         return _project_latent(backward_emb)
@@ -146,11 +151,6 @@ class TruncatedMultivariateNormalDiag(distrax.Distribution):
         return self._loc.shape
 
     def _sample_n(self, key: jax.Array, n: int) -> jax.Array:
-        # standardized_low = (self._low - self._loc) / self._scale_diag
-        # standardized_high = (self._high - self._loc) / self._scale_diag
-        # eps = jax.random.truncated_normal(
-        #     key, standardized_low, standardized_high, shape=(n, *self._low.shape)
-        # )
         eps = jax.random.normal(key, shape=(n, *self._loc.shape))
         eps *= self._scale_diag
         eps = jnp.where(self._clip > 0, jnp.clip(eps, -self._clip, self._clip), eps)
@@ -185,6 +185,10 @@ class GaussianActor(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
+        self._dim_state = dim_state
+        self._dim_action = dim_action
+        self._dim_latent = dim_latent
+
         self._action_low = action_low
         self._action_high = action_high
 
@@ -210,7 +214,11 @@ class GaussianActor(nnx.Module):
         self._policy = nnx.Sequential(*seq_layers)
 
     def __call__(
-        self, state: jax.Array, latent: jax.Array, stddev: float, clip: float = 0.0
+        self,
+        state: Float[Array, "*batch {self._dim_state}"],
+        latent: Float[Array, "*batch {self._dim_latent}"],
+        stddev: float,
+        clip: float = 0.0,
     ) -> TruncatedMultivariateNormalDiag:
         state_emb = self._embed_s(state)
         state_latent = jnp.concat((state, latent), axis=-1)
@@ -233,7 +241,9 @@ class ForwardBackwardModel(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        self.dim_latent = dim_latent
+        self._dim_state = dim_state
+        self._dim_action = dim_action
+        self._dim_latent = dim_latent
 
         # TODO: Replace with customizable number of ensembles, possibly with nnx.vmap.
         self.embed_forward1 = ForwardModel(dim_state, dim_action, dim_latent, rngs=rngs)
@@ -241,8 +251,16 @@ class ForwardBackwardModel(nnx.Module):
         self.embed_backward = BackwardModel(dim_state, dim_latent, rngs=rngs)
 
     def __call__(
-        self, state: jax.Array, action: jax.Array, latent: jax.Array, future_state: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        self,
+        state: Float[Array, "*batch {self._dim_state}"],
+        action: Float[Array, "*batch {self._dim_action}"],
+        latent: Float[Array, "*batch {self._dim_latent}"],
+        future_state: Float[Array, "*batch {self._dim_state}"],
+    ) -> tuple[
+        Float[Array, "*batch {self._dim_latent}"],
+        Float[Array, "*batch {self._dim_latent}"],
+        Float[Array, "*batch {self._dim_latent}"],
+    ]:
         forward_emb1 = self.embed_forward1(state, action, latent)
         forward_emb2 = self.embed_forward2(state, action, latent)
         backward_emb = self.embed_backward(future_state)
@@ -429,16 +447,22 @@ def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
 
 
 @nnx.jit
-def act(actor: GaussianActor, state: jax.Array, latent: jax.Array):
+def act(
+    actor: GaussianActor,
+    state: Float[Array, "*batch {actor._dim_state}"],
+    latent: Float[Array, "*batch {actor._dim_latent}"],
+):
     action_dist = actor(state, latent, 0.0)
     return action_dist.mean()
 
 
 @nnx.jit
 def infer_latent(
-    fb_model: ForwardBackwardModel, next_state: jax.Array, reward: jax.Array
-) -> jax.Array:
-    b_emb = fb_model.embed_backward(next_state)
+    fb_model: ForwardBackwardModel,
+    future_state: Float[Array, "*batch {fb_model.forward_emb1._dim_state}"],
+    reward: Float[Array, "*batch"],
+) -> Float[Array, "*batch {fb_model.forward_emb1._dim_latent}"]:
+    b_emb = fb_model.embed_backward(future_state)
     reward = jnp.expand_dims(reward, axis=1)
     latent = jnp.matmul(reward.T, b_emb).squeeze(0)
     latent = _project_latent(latent)
