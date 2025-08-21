@@ -8,6 +8,7 @@ import numpy as np
 import optax
 from flax import nnx
 from jax import numpy as jnp
+from jaxtyping import Array, Bool, Float, PRNGKeyArray
 
 from bfms.data import Dataset
 from bfms.typing import Image
@@ -254,20 +255,29 @@ class TrainConfig(NamedTuple):
     dim_latent: int
 
 
-def make_train_step(config: TrainConfig, batch_size: int):
-    @functools.partial(jax.jit, donate_argnums=(0, 1))
+class TrainState(NamedTuple):
+    fb_model: ForwardBackwardModel
+    target_fb_model: ForwardBackwardModel
+    actor: GaussianActor
+    fb_optimizer: nnx.Optimizer
+    actor_optimizer: nnx.Optimizer
+    key: PRNGKeyArray
+
+
+class BatchJAX(NamedTuple):
+    observation: Float[Array, "batch obs"]
+    action: Float[Array, "batch action"]
+    next_observation: Float[Array, "batch obs"]
+    terminated: Bool[Array, " batch"]
+
+
+def make_train_step(config: TrainConfig, batch_size: int, log_interval: int):
+    @functools.partial(nnx.scan, length=log_interval)
+    @functools.partial(nnx.jit, donate_argnums=(0, 1))
     def _train_step(
-        train_state: tuple[jax.Array, Any, Any], batch: dict[str, jax.Array]
-    ) -> tuple[tuple[jax.Array, Any, Any], tuple[jax.Array, jax.Array]]:
-        key, graph_def, state = train_state
-        fb_model, fb_model_target, actor, fb_optimizer, actor_optimizer = nnx.merge(
-            graph_def, state
-        )
-        fb_model = typing.cast(ForwardBackwardModel, fb_model)
-        fb_model_target = typing.cast(ForwardBackwardModel, fb_model_target)
-        actor = typing.cast(GaussianActor, actor)
-        fb_optimizer = typing.cast(nnx.Optimizer, fb_optimizer)
-        actor_optimizer = typing.cast(nnx.Optimizer, actor_optimizer)
+        train_state: TrainState, batch: BatchJAX
+    ) -> tuple[TrainState, dict[str, Float[Array, "1"]]]:
+        fb_model, target_fb_model, actor, fb_optimizer, actor_optimizer, key = train_state
 
         key, key_latent_ball = jax.random.split(key)
         # # Sample z's from uniformly from the Euclidean ball of radius \sqrt{d}
@@ -279,7 +289,7 @@ def make_train_step(config: TrainConfig, batch_size: int):
         # # Sample z from B(s); this is equivalent to sampling random goals.
         key, key_latent_goal = jax.random.split(key)
         permuted_index = jax.random.permutation(key_latent_goal, batch_size)
-        latent_goal = fb_model.embed_backward(batch["next_observation"][permuted_index])
+        latent_goal = fb_model.embed_backward(batch.next_observation[permuted_index])
 
         # # Mix two latents.
         # # TODO: Move to option.
@@ -292,14 +302,10 @@ def make_train_step(config: TrainConfig, batch_size: int):
         # We can use multiple options for the future state, and the next
         # state is one version of them. TODO: Implement other options.
         key, key_next_action = jax.random.split(key)
-        next_action_dist = actor(batch["next_observation"], latent, config.actor_stddev, 0.3)
+        next_action_dist = actor(batch.next_observation, latent, config.actor_stddev, 0.3)
         next_action = next_action_dist.sample(seed=key_next_action)
-        # TODO: Revert
-        # next_f_emb1, next_f_emb2, next_b_emb = fb_model_target(
-        #     batch["next_observation"], batch["next_action"], latent, batch["next_observation"]
-        # )
-        next_f_emb1, next_f_emb2, next_b_emb = fb_model_target(
-            batch["next_observation"], next_action, latent, batch["next_observation"]
+        next_f_emb1, next_f_emb2, next_b_emb = target_fb_model(
+            batch.next_observation, next_action, latent, batch.next_observation
         )
         # s: source (= batch size), t: target (= batch size), d: latent dimension.
         next_measures1 = jnp.einsum("sd,td->st", next_f_emb1, next_b_emb)
@@ -319,7 +325,7 @@ def make_train_step(config: TrainConfig, batch_size: int):
         # TODO: Write about reasoning to choose the option 2).
         def fb_loss_fn(fb_model: ForwardBackwardModel) -> tuple[jax.Array, dict[str, jax.Array]]:
             f_emb1, f_emb2, b_emb = fb_model(
-                batch["observation"], batch["action"], latent, batch["next_observation"]
+                batch.observation, batch.action, latent, batch.next_observation
             )
             measures1 = jnp.einsum("sd,td->st", f_emb1, b_emb)
             measures2 = jnp.einsum("sd,td->st", f_emb2, b_emb)
@@ -369,11 +375,11 @@ def make_train_step(config: TrainConfig, batch_size: int):
         ) -> tuple[jax.Array, dict[str, jax.Array]]:
             # Compute actor loss.
             # TODO: Implement improved weighted importance sampling (IWIS)
-            action_dist = actor(batch["observation"], latent, config.actor_stddev, 0.3)
+            action_dist = actor(batch.observation, latent, config.actor_stddev, 0.3)
             action = action_dist.sample(seed=key_action)
 
-            f_emb1 = fb_model.embed_forward1(batch["observation"], action, latent)
-            f_emb2 = fb_model.embed_forward2(batch["observation"], action, latent)
+            f_emb1 = fb_model.embed_forward1(batch.observation, action, latent)
+            f_emb2 = fb_model.embed_forward2(batch.observation, action, latent)
             q1 = (f_emb1 * latent).sum(axis=-1)
             q2 = (f_emb2 * latent).sum(axis=-1)
 
@@ -404,16 +410,15 @@ def make_train_step(config: TrainConfig, batch_size: int):
 
         # Perform soft-update on the target networks.
         fb_params = nnx.state(fb_model, nnx.Param)
-        target_fb_params = nnx.state(fb_model_target, nnx.Param)
+        target_fb_params = nnx.state(target_fb_model, nnx.Param)
         new_target_fb_params = jax.tree.map(
             lambda p, g: (0.99 * p) + (0.01 * g), target_fb_params, fb_params
         )
-        nnx.update(fb_model_target, new_target_fb_params)
+        nnx.update(target_fb_model, new_target_fb_params)
 
-        graph_def, state = nnx.split(
-            (fb_model, fb_model_target, actor, fb_optimizer, actor_optimizer)
-        )
-        return (key, graph_def, state), info_fb | info_actor | {
+        return TrainState(
+            fb_model, target_fb_model, actor, fb_optimizer, actor_optimizer, key
+        ), info_fb | info_actor | {
             "f1_global_norm": f1_grad_norm,
             "f2_global_norm": f2_grad_norm,
             "b_global_norm": b_grad_norm,
@@ -492,8 +497,9 @@ def evaluate(
 
         # Infer latents.
         batch = dataset.sample(num_inference_samples, with_reward=True)
-        batch = jax.tree.map(jnp.asarray, batch)
-        latent = infer_latent(fb_model, batch["next_observation"], batch["reward"])
+        latent = infer_latent(
+            fb_model, jnp.asarray(batch.next_observation), jnp.asarray(batch.reward[task])
+        )
 
         score = 0.0
         frames = []

@@ -109,7 +109,7 @@ class Dataset:
         self,
         task_id: str,
         actions: Float[np.ndarray, "batch action"],
-        next_observations: Float[np.ndarray, "batch obs"],
+        next_state: Float[np.ndarray, "batch obs"],
     ) -> Float[np.ndarray, " batch"]:
         raise NotImplementedError()
 
@@ -265,7 +265,9 @@ class ExoRLDataset(Dataset):
         )
         if with_reward:
             reward = {
-                task: self.get_rewards(task, batch.action, batch.next_observation)
+                task: self.get_rewards(
+                    task, batch.action, self._storage["next_state"][rand_indexes]
+                )
                 for task in self.tasks
             }
             batch = BatchWithReward(*batch, reward=reward)
@@ -276,17 +278,17 @@ class ExoRLDataset(Dataset):
         self,
         task: str,
         actions: Float[np.ndarray, "batch action"],
-        next_observations: Float[np.ndarray, "batch obs"],
+        next_state: Float[np.ndarray, "batch obs"],
     ) -> Float[np.ndarray, " batch"]:
         env = self.recover_environment(task, gym_compatible=False)
         env._physics = typing.cast(Physics, env._physics)
         env._task = typing.cast(base.Task, env._task)
 
         rewards = []
-        size = next_observations.shape[0]
+        size = next_state.shape[0]
         for i in range(size):
             with env._physics.reset_context():
-                env._physics.set_state(next_observations[i])
+                env._physics.set_state(next_state[i])
                 env._physics.set_control(actions[i])
             mujoco.mj_forward(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
             mujoco.mj_fwdPosition(env._physics.model.ptr, env._physics.data.ptr)  # pyright: ignore[reportAttributeAccessIssue]
